@@ -3,13 +3,11 @@ package com.showyool.blog_8;
 import com.alibaba.fastjson.JSON;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang.RandomStringUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.redisson.api.RBucket;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.transaction.TransactionStatus;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -97,7 +95,6 @@ public class EventWorker implements Runnable {
      * 当新表的记录还没有写入，双写更新的时候，新表的数据无法更新，相反，插入的还是旧数据
      */
     public void doUpdate() {
-        log.info("开始更新...");
         int index1 = userId % 2;
         int index2 = userId % 4;
         if (index1 == index2) {
@@ -110,33 +107,22 @@ public class EventWorker implements Runnable {
         // 这个是对旧表的更新
         this.jdbcTemplate.update(Constants.updateMap.get(index1), param);
         // 这个是对新表的更新 需要判断影响的行数
-
-        RLock rLock = redissonClient.getLock(Constants.D_KEY);
-        ConcurrentLinkedQueue<Tuple2<String, Object[]>> queue = null;
+        // 需要保证以下操作是一个原子操作
+        RLock rLock = redissonClient.getLock(Constants.D_USER_KEY + userId);
         try {
             rLock.lock();
-            queue = Constants.appendSQLs.get(userId);
-            if (queue == null) {
-                Constants.appendSQLs.put(userId, new ConcurrentLinkedQueue<>());
+            RBucket<String> redisUser = redissonClient.getBucket(Constants.USER_KEY + userId);
+            if (StringUtils.isEmpty(redisUser.get())) {
+                this.jdbcTemplate.update(Constants.updateMap.get(index2), param);
+            } else {
+                ConcurrentLinkedQueue<Tuple2<String, Object[]>> queue = safeGetQueue();
+                queue.add(new Tuple2<>(Constants.updateMap.get(index2), param));
             }
         } catch (Exception e) {
+            log.error("当前user_id: " + userId);
             e.printStackTrace();
         } finally {
             rLock.unlock();
-        }
-        if (queue == null || queue.isEmpty()) {
-            int effectRow = this.jdbcTemplate.update(Constants.updateMap.get(index2), param);
-            if (effectRow == 0) {
-                // 说明此刻数据还没有更新，需要加入到消费队列中
-                log.info("userId: [" + userId + "]需要加入到队列的数据: " + JSON.toJSONString(param));
-                if (queue == null) {
-                    Constants.appendSQLs.put(userId, new ConcurrentLinkedQueue<>());
-                }
-                Constants.appendSQLs.get(userId).add(new Tuple2<>(Constants.updateMap.get(index2), param));
-            }
-        } else {
-            log.info("userId: [" + userId + "]必须加入到队列的数据: " + JSON.toJSONString(param));
-            queue.add(new Tuple2<>(Constants.updateMap.get(index2), param));
         }
     }
 
@@ -152,7 +138,38 @@ public class EventWorker implements Runnable {
         Long orderId = this.jdbcTemplate.queryForObject(selectSQL, new Object[] {userId}, Long.class);
         Object[] param = new Object[] {orderId};
         this.jdbcTemplate.update(Constants.deleteMap.get(index1), param);
-        this.jdbcTemplate.update(Constants.deleteMap.get(index2), param);
+
+        // 先双写进行删除操作
+        int effectRow = this.jdbcTemplate.update(Constants.deleteMap.get(index2), param);
+        if (effectRow == 0) {
+            log.info("删除操作，userId: [" + userId + "]必须加入到队列的数据: " + JSON.toJSONString(param));
+            ConcurrentLinkedQueue<Tuple2<String, Object[]>> queue = safeGetQueue();
+            queue.add(new Tuple2<>(Constants.updateMap.get(index2), param));
+        }
+    }
+
+    private ConcurrentLinkedQueue<Tuple2<String, Object[]>> safeGetQueue() {
+        ConcurrentLinkedQueue<Tuple2<String, Object[]>> queue = Constants.appendSQLs.get(userId);
+        // 这里，也就是第一次进行初始化这个队列的时候是可能存在并发问题
+        // 如果不做控制，那么后者可能会把前者创造的队列给覆盖掉
+        if (queue == null) {
+            RLock rLock = redissonClient.getLock(Constants.D_KEY + userId);
+            try {
+                rLock.lock();
+                // 这里采用的是双重监测锁的思路
+                queue = Constants.appendSQLs.get(userId);
+                if (queue == null) {
+                    queue = new ConcurrentLinkedQueue<>();
+                    Constants.appendSQLs.put(userId, queue);
+                }
+            } catch (Exception e) {
+                log.error("当前user_id: " + userId);
+                e.printStackTrace();
+            } finally {
+                rLock.unlock();
+            }
+        }
+        return queue;
     }
 
     /**

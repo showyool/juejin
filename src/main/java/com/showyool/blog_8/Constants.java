@@ -8,7 +8,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class Constants {
 
-    public static final String D_KEY = "com:showyool:key";
+    public static final String D_KEY = "com:showyool:key:";
+    public static final String D_USER_KEY = "com:showyool:get:user:";
+    public static final String USER_KEY = "com:showyool:user:";
 
     public static Map<Integer, String> tableMap = Maps.newHashMap();
     public static Map<Integer, String> insertMap = Maps.newHashMap();

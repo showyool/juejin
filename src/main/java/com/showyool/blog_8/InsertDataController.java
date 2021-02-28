@@ -95,8 +95,7 @@ public class InsertDataController {
                 for (Order order : orders) {
                     try {
                         this.jdbcTemplate.update(insertSql, new Object[]{order.getId(), order.getUser_id(), order.getId(), order.getCount()});
-                    }
-                    catch (Exception e) {
+                    } catch (Exception e) {
                         // 例如MySQLIntegrityConstraintViolationException主键冲突问题，则忽略
                         e.printStackTrace();
                     }
@@ -104,7 +103,7 @@ public class InsertDataController {
                 start = orders.get(orders.size() - 1).getId();
             }
             ConcurrentLinkedQueue<Tuple2<String, Object[]>> queue = null;
-            RLock rLock = redissonClient.getLock(Constants.D_KEY);
+            RLock rLock = redissonClient.getLock(Constants.D_KEY + i);
             try {
                 rLock.lock();
                 queue = Constants.appendSQLs.get(i);
@@ -117,9 +116,18 @@ public class InsertDataController {
                 Tuple2<String, Object[]> tuple2 = queue.poll();
                 this.jdbcTemplate.update(tuple2.getT1(), tuple2.getT2());
             }
+            RLock dUserLock = redissonClient.getLock(Constants.D_USER_KEY + i);
+            try {
+                dUserLock.lock();
+                redissonClient.getBucket(Constants.USER_KEY + i).delete();
+            } catch (Exception e) {
+                e.printStackTrace();
+            } finally {
+                dUserLock.unlock();
+            }
             log.info("userId: [" + i + "]迁移工作结束");
         }
-        // 开始校准工作
+        // 开始检查工作
         doCheckWork();
         return "SUCCESS";
     }
@@ -133,8 +141,20 @@ public class InsertDataController {
     public Object doubleWrite() {
         // 模拟1000个请求
         // 对库表会产生影响只有新增、删除、更新操作，所以这里的查询操作就不进行处理
-        for (int i = 0; i < 1000; i++) {
+        for (int i = 0; i < 2000; i++) {
             threadPool.submit(new EventWorker(Integer.parseInt(chooseUser()), chooseEvent(), jdbcTemplate, redissonClient, transactionTemplate));
+        }
+        return "SUCCESS";
+    }
+
+    /**
+     * 在Redis当中初始化用户数据
+     */
+    @RequestMapping(value = "/initRedisUser", method = RequestMethod.GET)
+    public Object initRedisUser() {
+        for (int i = 0; i < 1000; i++) {
+            RBucket<String> redisUser = redissonClient.getBucket(Constants.USER_KEY + i);
+            redisUser.set("0");
         }
         return "SUCCESS";
     }
@@ -146,13 +166,13 @@ public class InsertDataController {
     }
 
     /**
-     * 校准工作
-     * 主要是为了校准两阶段的结果
+     * 检查工作
+     * 主要是为了检查两阶段的结果
      * 1. 迁移工作造成的数据差异（迁移工作应该要保证这一部分不要出错）
      * 2. 迁移工作之后正常流量的双写造成的数据差异
      * <p>
-     * 此外，校准工作不是一次性任务，而是需要定时地进行查询
-     * 这里为了简便，以查询每个用户下有多少订单和总共涉及到的商品数量当做校准
+     * 此外，检查工作不是一次性任务，而是需要定时地进行查询
+     * 这里为了简便，以查询每个用户下有多少订单和总共涉及到的商品数量当做检查
      * 每一个场景需要具体深入判断，这个视观众具体业务场景判断
      */
     private void doCheckWork() {
@@ -166,25 +186,29 @@ public class InsertDataController {
         map2.put(1, "select sum(count) from order_1 where user_id = ?");
         map2.put(2, "select sum(count) from order_2 where user_id = ?");
         map2.put(3, "select sum(count) from order_3 where user_id = ?");
-        // 由于测试数据是模拟0-1000这些用户的，所以这里就当做所有用户进行校准工作
+        // 由于测试数据是模拟0-1000这些用户的，所以这里就当做所有用户进行检查工作
         int pass = 0;
         int fail = 0;
         for (int i = 0; i < 1000; i++) {
             int from = i % 2;
             int to = i % 4;
+            if (from == to) {
+                pass++;
+                continue;
+            }
             Integer fromCount = jdbcTemplate.queryForObject(map1.get(from), new Object[]{i}, Integer.class);
             Integer toCount = jdbcTemplate.queryForObject(map1.get(to), new Object[]{i}, Integer.class);
             Integer fromSum = jdbcTemplate.queryForObject(map2.get(from), new Object[]{i}, Integer.class);
             Integer toSum = jdbcTemplate.queryForObject(map2.get(to), new Object[]{i}, Integer.class);
             if (fromCount.equals(toCount) && fromSum.equals(toSum)) {
-                log.info("用户ID:" + i + "校准通过");
+                log.info("用户ID:" + i + "检查通过, 原表数量: " + fromCount + ", 新表数量: " + toCount + ", 原表商品总数: " + fromSum + ", 新表商品总数: " + toSum);
                 pass++;
             } else {
-                log.error("用户ID:" + i + "校准不通过，原表数量: " + fromCount + ", 新表数量: " + toCount + ", 原表商品总数: " + fromSum + ", 新表商品总数: " + toSum);
+                log.error("用户ID:" + i + "检查不通过，原表数量: " + fromCount + ", 新表数量: " + toCount + ", 原表商品总数: " + fromSum + ", 新表商品总数: " + toSum);
                 fail++;
             }
         }
-        System.out.println("校准通过: " + pass + "，校准失败: " + fail);
+        System.out.println("检查通过: " + pass + "，检查失败: " + fail);
     }
 
     /**
